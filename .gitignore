@@ -136,3 +136,4 @@ dmypy.json
 logs/
 
 model_store/
+models/

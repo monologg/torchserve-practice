@@ -4,8 +4,9 @@ import logging
 import os
 
 import torch
+import numpy as np
 from transformers import ElectraTokenizer
-from src import ElectraForSequenceClassification
+from model import ElectraForSequenceClassification
 
 from ts.torch_handler.base_handler import BaseHandler
 
@@ -23,6 +24,7 @@ class NSMCClassifierHandler(BaseHandler, ABC):
         properties = context.system_properties
         model_dir = properties.get("model_dir")
         self.device = torch.device("cuda:" + str(properties.get("gpu_id")) if torch.cuda.is_available() else "cpu")
+        logger.info("device: {}".format(self.device))
 
         self.model = ElectraForSequenceClassification.from_pretrained(model_dir)
         self.tokenizer = ElectraTokenizer.from_pretrained(model_dir)
@@ -32,52 +34,45 @@ class NSMCClassifierHandler(BaseHandler, ABC):
 
         logger.info("Model from path {} loaded successfully".format(model_dir))
 
-        # Read the mapping file, index to object name
-        mapping_file_path = os.path.join(model_dir, "index_to_name.json")
-
-        if os.path.isfile(mapping_file_path):
-            with open(mapping_file_path) as f:
-                self.mapping = json.load(f)
-        else:
-            logger.warning('Missing the index_to_name.json file. Inference output will not include class name.')
-
         self.initialized = True
 
     def preprocess(self, data):
         text = data[0].get("data")
         if text is None:
             text = data[0].get("body")
-        sentences = text.decode("utf-8")
-        logger.info("Received text: '{}'".format(sentences))
+        logger.info("Received text: '{}'".format(text))
 
         inputs = self.tokenizer.encode_plus(
-            sentences,
+            text,
             add_special_tokens=True,
             return_tensors="pt"
         )
         return inputs
 
     def inference(self, data):
-        batch = tuple(t.to(self.device) for t in data)
-        inputs = {
-            "input_ids": batch[0],
-            "attention_mask": batch[1],
-            "token_type_ids": batch[2]
+        with torch.no_grad():
+            prediction = self.model(
+                input_ids=data["input_ids"].to(self.device),
+                attention_mask=data["attention_mask"].to(self.device),
+                token_type_ids=data["token_type_ids"].to(self.device)
+            )[0].cpu().numpy()
+
+        score = np.exp(prediction) / np.exp(prediction).sum(-1, keepdims=True)
+
+        result = {
+            "label": self.model.config.id2label[score.argmax()],
+            "score": score.max().item()
         }
-        prediction = self.model(**inputs)[0].cpu().argmax().item()
 
-        logger.info("Model predicted: '%s'", prediction)
-
-        if self.mapping:
-            prediction = self.mapping[str(prediction)]
-
-        return [prediction]
+        logger.info("Model predicted: '%s'", result)
+        return [result]
 
     def postprocess(self, data):
         return data
 
     def handle(self, data, context):
         model_input = self.preprocess(data)
+        logger.info(model_input)
         model_out = self.inference(model_input)
         return self.postprocess(model_out)
 
